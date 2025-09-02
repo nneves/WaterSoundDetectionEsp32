@@ -1,372 +1,277 @@
 #include <Arduino.h>
-#include <TFT_eSPI.h>
-#include <lvgl.h>
-#include <driver/i2s.h>
-#include <WiFi.h>
+#include <Wire.h>
 #include <SPI.h>
+#include <driver/i2s.h>
+#include <esp_timer.h>
+#include <driver/gpio.h>
+#include <driver/spi_master.h>
+#include "pin_config.h"
 
-// Display object
-TFT_eSPI tft = TFT_eSPI();
+// TensorFlow Lite Micro includes  
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/system_setup.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "model_improved_int8_3_2_1.h"
 
-// LVGL display buffer - CORRECTED for 466x466 resolution
-static lv_disp_draw_buf_t draw_buf;
-static lv_color_t buf[466 * 10]; // 10 lines buffer
+// Display control variables
+spi_device_handle_t spi_handle;
+bool display_initialized = false;
 
-// LVGL objects for our demo
-lv_obj_t *temp_label;
-lv_obj_t *humidity_label;
-lv_obj_t *battery_bar;
-lv_obj_t *wifi_label;
-lv_obj_t *touch_label;
+// Simple demo variables
+unsigned long last_status = 0;
+unsigned long boot_time = 0;
 
-// Audio configuration
-#define I2S_SAMPLE_RATE     44100
-#define I2S_SAMPLE_BITS     16
-#define I2S_READ_LEN        1024
-#define I2S_CHANNEL_NUM     2
-
-// Microphone I2S configuration
-#define MIC_I2S_PORT        I2S_NUM_0
-#define MIC_I2S_SAMPLE_RATE 16000
-#define MIC_I2S_SAMPLE_BITS 16
-#define MIC_I2S_READ_LEN    512
-
-// Demo variables
-float demo_temp = 23.5;
-float demo_humidity = 65.0;
-int demo_battery = 85;
-bool wifi_connected = false;
-unsigned long last_update = 0;
-
-// LVGL display flush callback
-void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
-    uint32_t w = (area->x2 - area->x1 + 1);
-    uint32_t h = (area->y2 - area->y1 + 1);
-
-    tft.startWrite();
-    tft.setAddrWindow(area->x1, area->y1, w, h);
-    tft.pushColors((uint16_t*)&color_p->full, w * h, true);
-    tft.endWrite();
-
-    lv_disp_flush_ready(disp);
+// TensorFlow Lite Micro variables
+namespace {
+    // Model constants based on your Python script
+    constexpr int kMfccFeatures = 13;  // Number of MFCC coefficients
+    constexpr int kMfccFrames = 200;   // Number of time frames (padded sequence length)
+    constexpr int kTensorArenaSize = 140 * 1024;  // 140KB for model operations
+    constexpr int kInputSize = kMfccFrames * kMfccFeatures;  // 200 * 13 = 2600
+    constexpr int kOutputSize = 1;  // Single prediction output
+    
+    // TensorFlow Lite Micro objects
+    const tflite::Model* model = nullptr;
+    tflite::MicroInterpreter* interpreter = nullptr;
+    TfLiteTensor* input = nullptr;
+    TfLiteTensor* output = nullptr;
+    uint8_t tensor_arena[kTensorArenaSize];
+    
+    // Model initialization flag
+    bool model_initialized = false;
 }
 
-// LVGL touch input callback
-void my_touchpad_read(lv_indev_drv_t * indev_driver, lv_indev_data_t * data) {
-    uint16_t touchX, touchY;
-    bool touched = tft.getTouch(&touchX, &touchY);
-
-    if (touched) {
-        data->state = LV_INDEV_STATE_PR;
-        data->point.x = touchX;
-        data->point.y = touchY;
-    } else {
-        data->state = LV_INDEV_STATE_REL;
+void scanI2CDevices() {
+    Serial.println("=== I2C Device Scanner ===");
+    Wire.begin(IIC_SDA, IIC_SCL);
+    Serial.printf("I2C initialized: SDA=%d, SCL=%d\n", IIC_SDA, IIC_SCL);
+    
+    byte error, address;
+    int nDevices = 0;
+    
+    for (address = 1; address < 127; address++) {
+        Wire.beginTransmission(address);
+        error = Wire.endTransmission();
+        
+        if (error == 0) {
+            Serial.printf("I2C device found at address 0x%02X\n", address);
+            nDevices++;
+        }
     }
+    
+    if (nDevices == 0) {
+        Serial.println("No I2C devices found");
+    } else {
+        Serial.printf("Found %d I2C device(s)\n", nDevices);
+    }
+    Serial.println("=== End I2C Scan ===\n");
 }
 
-void setupDisplay() {
-    Serial.println("DEBUG: Starting display setup...");
-    delay(500); // Longer delay for power stabilization
-    
-    // Check if SPI pins are properly configured
-    Serial.println("DEBUG: SPI Pin configuration:");
-    Serial.printf("  MOSI: %d\n", TFT_MOSI);
-    Serial.printf("  SCLK: %d\n", TFT_SCLK);
-    Serial.printf("  CS: %d\n", TFT_CS);
-    Serial.printf("  DC: %d\n", TFT_DC);
-    Serial.printf("  RST: %d\n", TFT_RST);
-    
-    // Force correct pins before any SPI setup
-    Serial.println("DEBUG: Forcing correct pin definitions...");
-    
-    // Manual SPI setup with EXACT pins from datasheet
-    Serial.println("DEBUG: Setting up SPI with datasheet pins...");
-    // GPIO1=MOSI, GPIO3=MISO, GPIO2=SCLK, GPIO12=CS
-    SPI.begin(2, 3, 1, 12);  // SCLK, MISO, MOSI, CS
-    delay(100);
-    Serial.println("DEBUG: SPI.begin() with correct pins completed");
-    
-    // Manual pin setup with exact GPIO numbers
-    Serial.println("DEBUG: Setting up control pins...");
-    pinMode(12, OUTPUT);  // CS
-    pinMode(39, OUTPUT);  // RST
-    // DC not used for this display
-    
-    // Reset display manually using exact GPIO
-    Serial.println("DEBUG: Manual display reset...");
-    digitalWrite(39, LOW);   // RST = GPIO39
+void displayReset() {
+    Serial.println("Performing display reset sequence...");
+    gpio_set_level((gpio_num_t)LCD_RESET, 0);
     delay(20);
-    digitalWrite(39, HIGH);  // RST = GPIO39
-    delay(150);
-    Serial.println("DEBUG: Manual reset completed");
+    gpio_set_level((gpio_num_t)LCD_RESET, 1);
+    delay(120);
+    Serial.println("Display reset completed");
+}
+
+void setupQSPIDisplay() {
+    Serial.println("=== QSPI Display Initialization ===");
+    Serial.printf("LCD_SCLK: GPIO%d\n", LCD_SCLK);
+    Serial.printf("LCD_CS: GPIO%d\n", LCD_CS);
+    Serial.printf("LCD_RESET: GPIO%d\n", LCD_RESET);
+    Serial.printf("LCD_SDIO0-3: GPIO%d,%d,%d,%d\n", LCD_SDIO0, LCD_SDIO1, LCD_SDIO2, LCD_SDIO3);
+    Serial.printf("Resolution: %dx%d\n", LCD_WIDTH, LCD_HEIGHT);
     
-    // Initialize TFT display with error handling
-    Serial.println("DEBUG: Calling tft.init()...");
-    try {
-        tft.init();
-        delay(200);
-        Serial.println("DEBUG: tft.init() completed successfully");
-    } catch (...) {
-        Serial.println("ERROR: tft.init() failed with exception");
+    // Configure reset pin
+    gpio_config_t reset_conf = {
+        .pin_bit_mask = (1ULL << LCD_RESET),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&reset_conf);
+    
+    // Reset display
+    displayReset();
+    
+    // Configure SPI bus for QSPI (4-bit) communication
+    spi_bus_config_t bus_config = {
+        .mosi_io_num = LCD_SDIO0,
+        .miso_io_num = LCD_SDIO1, 
+        .sclk_io_num = LCD_SCLK,
+        .quadwp_io_num = LCD_SDIO2,
+        .quadhd_io_num = LCD_SDIO3,
+        .max_transfer_sz = LCD_WIDTH * LCD_HEIGHT * 2 // 16-bit color
+    };
+    
+    esp_err_t ret = spi_bus_initialize(SPI3_HOST, &bus_config, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK) {
+        Serial.printf("SPI bus initialization failed: %s\n", esp_err_to_name(ret));
         return;
     }
     
-    Serial.println("DEBUG: Setting rotation...");
-    tft.setRotation(0);
-    delay(100);
-    Serial.println("DEBUG: Rotation set to 0");
+    // Configure SPI device
+    spi_device_interface_config_t dev_config = {
+        .mode = 0,
+        .clock_speed_hz = 80 * 1000 * 1000, // 80 MHz
+        .spics_io_num = LCD_CS,
+        .flags = SPI_DEVICE_HALFDUPLEX,
+        .queue_size = 1
+    };
     
-    Serial.println("DEBUG: Testing basic drawing...");
-    tft.fillScreen(TFT_BLACK);
-    delay(100);
-    Serial.println("DEBUG: Screen filled black");
-    
-    // Test basic drawing
-    tft.drawPixel(50, 50, TFT_RED);
-    delay(50);
-    Serial.println("DEBUG: Test pixel drawn");
-    
-    Serial.println("Display initialized successfully!");
-}
-
-void setupLVGL() {
-    Serial.println("DEBUG: Starting LVGL initialization...");
-    
-    Serial.println("DEBUG: Calling lv_init()...");
-    lv_init();
-    Serial.println("DEBUG: lv_init() completed");
-    
-    // Initialize display buffer
-    Serial.println("DEBUG: Initializing display buffer...");
-    lv_disp_draw_buf_init(&draw_buf, buf, NULL, 466 * 10);
-    Serial.printf("DEBUG: Display buffer initialized with size: %d bytes\n", sizeof(buf));
-    
-    // Initialize display driver
-    Serial.println("DEBUG: Setting up display driver...");
-    static lv_disp_drv_t disp_drv;
-    lv_disp_drv_init(&disp_drv);
-    disp_drv.hor_res = 466;
-    disp_drv.ver_res = 466;
-    disp_drv.flush_cb = my_disp_flush;
-    disp_drv.draw_buf = &draw_buf;
-    Serial.println("DEBUG: Display driver configured, registering...");
-    lv_disp_drv_register(&disp_drv);
-    Serial.println("DEBUG: Display driver registered");
-    
-    // Initialize touch input driver
-    Serial.println("DEBUG: Setting up touch input driver...");
-    static lv_indev_drv_t indev_drv;
-    lv_indev_drv_init(&indev_drv);
-    indev_drv.type = LV_INDEV_TYPE_POINTER;
-    indev_drv.read_cb = my_touchpad_read;
-    lv_indev_drv_register(&indev_drv);
-    Serial.println("DEBUG: Touch input driver registered");
-    
-    Serial.println("LVGL initialized successfully!");
-}
-
-void createUI() {
-    Serial.println("DEBUG: Starting UI creation...");
-    
-    // Create main screen
-    Serial.println("DEBUG: Getting active screen...");
-    lv_obj_t *scr = lv_scr_act();
-    if (scr == NULL) {
-        Serial.println("ERROR: Failed to get active screen!");
+    ret = spi_bus_add_device(SPI3_HOST, &dev_config, &spi_handle);
+    if (ret != ESP_OK) {
+        Serial.printf("SPI device add failed: %s\n", esp_err_to_name(ret));
         return;
     }
-    Serial.println("DEBUG: Active screen obtained, setting background...");
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
-    Serial.println("DEBUG: Background color set to black");
     
-    // Title label
-    Serial.println("DEBUG: Creating title label...");
-    lv_obj_t *title = lv_label_create(scr);
-    if (title == NULL) {
-        Serial.println("ERROR: Failed to create title label!");
-        return;
-    }
-    Serial.println("DEBUG: Title label created, setting text...");
-    lv_label_set_text(title, "ESP32-S3 AMOLED Demo");
-    lv_obj_set_style_text_color(title, lv_color_hex(0x00FFFF), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
-    Serial.println("DEBUG: Title label configured and aligned");
-    
-    // Temperature panel
-    lv_obj_t *temp_panel = lv_obj_create(scr);
-    lv_obj_set_size(temp_panel, 180, 80);
-    lv_obj_align(temp_panel, LV_ALIGN_TOP_LEFT, 10, 50);
-    lv_obj_set_style_bg_color(temp_panel, lv_color_hex(0x1E1E1E), 0);
-    lv_obj_set_style_border_color(temp_panel, lv_color_hex(0xFF6B35), 0);
-    lv_obj_set_style_border_width(temp_panel, 2, 0);
-    lv_obj_set_style_radius(temp_panel, 10, 0);
-    
-    lv_obj_t *temp_title = lv_label_create(temp_panel);
-    lv_label_set_text(temp_title, "Temperature");
-    lv_obj_set_style_text_color(temp_title, lv_color_hex(0xFF6B35), 0);
-    lv_obj_align(temp_title, LV_ALIGN_TOP_MID, 0, 5);
-    
-    temp_label = lv_label_create(temp_panel);
-    lv_label_set_text(temp_label, "23.5°C");
-    lv_obj_set_style_text_color(temp_label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(temp_label, &lv_font_montserrat_16, 0);
-    lv_obj_align(temp_label, LV_ALIGN_CENTER, 0, 10);
-    
-    // Humidity panel
-    lv_obj_t *hum_panel = lv_obj_create(scr);
-    lv_obj_set_size(hum_panel, 180, 80);
-    lv_obj_align(hum_panel, LV_ALIGN_TOP_RIGHT, -10, 50);
-    lv_obj_set_style_bg_color(hum_panel, lv_color_hex(0x1E1E1E), 0);
-    lv_obj_set_style_border_color(hum_panel, lv_color_hex(0x4ECDC4), 0);
-    lv_obj_set_style_border_width(hum_panel, 2, 0);
-    lv_obj_set_style_radius(hum_panel, 10, 0);
-    
-    lv_obj_t *hum_title = lv_label_create(hum_panel);
-    lv_label_set_text(hum_title, "Humidity");
-    lv_obj_set_style_text_color(hum_title, lv_color_hex(0x4ECDC4), 0);
-    lv_obj_align(hum_title, LV_ALIGN_TOP_MID, 0, 5);
-    
-    humidity_label = lv_label_create(hum_panel);
-    lv_label_set_text(humidity_label, "65.0%");
-    lv_obj_set_style_text_color(humidity_label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(humidity_label, &lv_font_montserrat_16, 0);
-    lv_obj_align(humidity_label, LV_ALIGN_CENTER, 0, 10);
-    
-    // Battery bar
-    lv_obj_t *bat_label = lv_label_create(scr);
-    lv_label_set_text(bat_label, "Battery Level");
-    lv_obj_set_style_text_color(bat_label, lv_color_hex(0x95E1D3), 0);
-    lv_obj_align(bat_label, LV_ALIGN_LEFT_MID, 10, -40);
-    
-    battery_bar = lv_bar_create(scr);
-    lv_obj_set_size(battery_bar, 380, 20);
-    lv_obj_align(battery_bar, LV_ALIGN_LEFT_MID, 10, -10);
-    lv_bar_set_range(battery_bar, 0, 100);
-    lv_bar_set_value(battery_bar, demo_battery, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(battery_bar, lv_color_hex(0x2D2D2D), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(battery_bar, lv_color_hex(0x4CAF50), LV_PART_INDICATOR);
-    lv_obj_set_style_radius(battery_bar, 10, 0);
-    
-    // WiFi status
-    wifi_label = lv_label_create(scr);
-    lv_label_set_text(wifi_label, "WiFi: Disconnected");
-    lv_obj_set_style_text_color(wifi_label, lv_color_hex(0xFFC107), 0);
-    lv_obj_align(wifi_label, LV_ALIGN_LEFT_MID, 10, 30);
-    
-    // Touch coordinates
-    touch_label = lv_label_create(scr);
-    lv_label_set_text(touch_label, "Touch: No touch detected");
-    lv_obj_set_style_text_color(touch_label, lv_color_hex(0xE91E63), 0);
-    lv_obj_align(touch_label, LV_ALIGN_LEFT_MID, 10, 60);
-    
-    // Create some interactive buttons
-    lv_obj_t *btn1 = lv_btn_create(scr);
-    lv_obj_set_size(btn1, 120, 50);
-    lv_obj_align(btn1, LV_ALIGN_BOTTOM_LEFT, 10, -10);
-    lv_obj_set_style_bg_color(btn1, lv_color_hex(0x9C27B0), 0);
-    lv_obj_set_style_radius(btn1, 25, 0);
-    
-    lv_obj_t *btn1_label = lv_label_create(btn1);
-    lv_label_set_text(btn1_label, "Button 1");
-    lv_obj_center(btn1_label);
-    
-    lv_obj_t *btn2 = lv_btn_create(scr);
-    lv_obj_set_size(btn2, 120, 50);
-    lv_obj_align(btn2, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
-    lv_obj_set_style_bg_color(btn2, lv_color_hex(0xFF5722), 0);
-    lv_obj_set_style_radius(btn2, 25, 0);
-    
-    lv_obj_t *btn2_label = lv_label_create(btn2);
-    lv_label_set_text(btn2_label, "Button 2");
-    lv_obj_center(btn2_label);
-    
-    // Status indicator (circular)
-    lv_obj_t *status_arc = lv_arc_create(scr);
-    lv_obj_set_size(status_arc, 80, 80);
-    lv_obj_align(status_arc, LV_ALIGN_BOTTOM_MID, 0, -80);
-    lv_arc_set_range(status_arc, 0, 100);
-    lv_arc_set_value(status_arc, 75);
-    lv_obj_set_style_arc_color(status_arc, lv_color_hex(0x2196F3), LV_PART_INDICATOR);
-    lv_obj_set_style_arc_width(status_arc, 8, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(status_arc, lv_color_hex(0x424242), LV_PART_MAIN);
-    lv_obj_set_style_arc_width(status_arc, 8, LV_PART_MAIN);
-    
-    lv_obj_t *arc_label = lv_label_create(status_arc);
-    lv_label_set_text(arc_label, "75%");
-    lv_obj_set_style_text_color(arc_label, lv_color_hex(0x2196F3), 0);
-    lv_obj_center(arc_label);
-    
-    Serial.println("DEBUG: UI creation completed successfully!");
-    Serial.println("LVGL UI created successfully!");
+    Serial.println("QSPI bus initialized successfully");
+    display_initialized = true;
+    Serial.println("=== End QSPI Setup ===\n");
 }
 
-void updateDemoData() {
-    // Update demo values with some animation
-    static float temp_delta = 0.1;
-    static float hum_delta = 0.2;
-    static int bat_delta = 1;
+void sendCommand(uint8_t cmd) {
+    if (!display_initialized) return;
     
-    demo_temp += temp_delta;
-    if (demo_temp > 30.0 || demo_temp < 20.0) temp_delta = -temp_delta;
+    spi_transaction_t trans = {
+        .flags = SPI_TRANS_USE_TXDATA,
+        .length = 8,
+        .tx_data = {cmd}
+    };
     
-    demo_humidity += hum_delta;
-    if (demo_humidity > 80.0 || demo_humidity < 40.0) hum_delta = -hum_delta;
-    
-    demo_battery += bat_delta;
-    if (demo_battery > 100 || demo_battery < 20) bat_delta = -bat_delta;
-    
-    // Update UI elements
-    char temp_str[20];
-    sprintf(temp_str, "%.1f°C", demo_temp);
-    lv_label_set_text(temp_label, temp_str);
-    
-    char hum_str[20];
-    sprintf(hum_str, "%.1f%%", demo_humidity);
-    lv_label_set_text(humidity_label, hum_str);
-    
-    lv_bar_set_value(battery_bar, demo_battery, LV_ANIM_ON);
-    
-    // Update WiFi status (toggle for demo)
-    wifi_connected = !wifi_connected;
-    if (wifi_connected) {
-        lv_label_set_text(wifi_label, "WiFi: Connected");
-        lv_obj_set_style_text_color(wifi_label, lv_color_hex(0x4CAF50), 0);
-    } else {
-        lv_label_set_text(wifi_label, "WiFi: Disconnected");
-        lv_obj_set_style_text_color(wifi_label, lv_color_hex(0xFFC107), 0);
+    esp_err_t ret = spi_device_transmit(spi_handle, &trans);
+    if (ret != ESP_OK) {
+        Serial.printf("Command send failed: %s\n", esp_err_to_name(ret));
     }
 }
 
-void updateTouchDisplay() {
-    uint16_t x, y;
-    static uint16_t last_x = 0, last_y = 0;
-    static bool was_touched = false;
+void sendData(uint8_t data) {
+    if (!display_initialized) return;
     
-    boolean touched = tft.getTouch(&x, &y);
+    spi_transaction_t trans = {
+        .flags = SPI_TRANS_USE_TXDATA,
+        .length = 8,
+        .tx_data = {data}
+    };
     
-    if (touched) {
-        if (!was_touched || abs(x - last_x) > 5 || abs(y - last_y) > 5) {
-            char touch_str[50];
-            sprintf(touch_str, "Touch: X=%d, Y=%d", x, y);
-            lv_label_set_text(touch_label, touch_str);
-            last_x = x;
-            last_y = y;
+    esp_err_t ret = spi_device_transmit(spi_handle, &trans);
+    if (ret != ESP_OK) {
+        Serial.printf("Data send failed: %s\n", esp_err_to_name(ret));
+    }
+}
+
+void initializeDisplay() {
+    if (!display_initialized) return;
+    
+    Serial.println("Initializing CO5300 AMOLED controller...");
+    
+    // CO5300 AMOLED initialization sequence from Arduino_GFX
+    sendCommand(0x11); // Sleep Out
+    delay(120);
+    
+    // Configuration commands
+    sendCommand(0xFE); sendData(0x00);  // Page select
+    sendCommand(0xC4); sendData(0x80);  // SPI mode control
+    sendCommand(0x3A); sendData(0x55);  // Interface Pixel Format 16bit/pixel
+    sendCommand(0x53); sendData(0x20);  // Write CTRL Display1
+    sendCommand(0x63); sendData(0xFF);  // Write Display Brightness Value in HBM Mode
+    sendCommand(0x29);                  // Display ON
+    sendCommand(0x51); sendData(0xD0);  // Brightness adjustment (208/255)
+    sendCommand(0x58); sendData(0x00);  // Write CE (contrast enhancement off)
+    
+    delay(10);
+    
+    Serial.println("CO5300 AMOLED controller initialized");
+}
+
+void setAddressWindow(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
+    if (!display_initialized) return;
+    
+    // Set column address (CO5300_W_CASET = 0x2A)
+    sendCommand(0x2A);
+    sendData(x0 >> 8); sendData(x0 & 0xFF); // Start column
+    sendData(x1 >> 8); sendData(x1 & 0xFF); // End column
+    
+    // Set row address (CO5300_W_PASET = 0x2B)
+    sendCommand(0x2B);
+    sendData(y0 >> 8); sendData(y0 & 0xFF); // Start row
+    sendData(y1 >> 8); sendData(y1 & 0xFF); // End row
+    
+    // Memory write start (CO5300_W_RAMWR = 0x2C)
+    sendCommand(0x2C);
+}
+
+void fillScreen(uint16_t color) {
+    if (!display_initialized) return;
+    
+    Serial.printf("Filling screen with color 0x%04X...\n", color);
+    
+    // Set full screen address window
+    setAddressWindow(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1);
+    
+    // Send color data for entire screen
+    uint8_t color_high = color >> 8;
+    uint8_t color_low = color & 0xFF;
+    
+    // Send pixel data in chunks to avoid blocking
+    const int chunk_size = 1000;
+    int total_pixels = LCD_WIDTH * LCD_HEIGHT;
+    
+    for (int chunk = 0; chunk < total_pixels; chunk += chunk_size) {
+        int pixels_in_chunk = min(chunk_size, total_pixels - chunk);
+        
+        for (int i = 0; i < pixels_in_chunk; i++) {
+            sendData(color_high);
+            sendData(color_low);
         }
-        was_touched = true;
-    } else {
-        if (was_touched) {
-            lv_label_set_text(touch_label, "Touch: No touch detected");
-            was_touched = false;
+        
+        // Small delay to prevent overwhelming the display
+        if (chunk % 10000 == 0) {
+            Serial.printf("Progress: %d%%\n", (chunk * 100) / total_pixels);
+            delay(1);
         }
     }
+    
+    Serial.println("Screen fill completed");
 }
 
-void setupAudioOutput() {
+void testBasicDrawing() {
+    if (!display_initialized) return;
+    
+    Serial.println("Testing basic drawing functions...");
+    
+    // Draw a small square in the center
+    int center_x = LCD_WIDTH / 2;
+    int center_y = LCD_HEIGHT / 2;
+    int size = 50;
+    
+    setAddressWindow(center_x - size, center_y - size, center_x + size, center_y + size);
+    
+    // Fill with white
+    for (int i = 0; i < (size * 2) * (size * 2); i++) {
+        sendData(0xFF); // White high byte
+        sendData(0xFF); // White low byte
+    }
+    
+    Serial.println("Basic drawing test completed");
+}
+
+void setupAudio() {
+    Serial.println("=== Audio Configuration ===");
+    Serial.printf("I2S_BCK_IO: GPIO%d\n", I2S_BCK_IO);
+    Serial.printf("I2S_WS_IO: GPIO%d\n", I2S_WS_IO);
+    Serial.printf("I2S_DO_IO: GPIO%d\n", I2S_DO_IO);
+    Serial.printf("I2S_DI_IO: GPIO%d\n", I2S_DI_IO);
+    Serial.printf("PA (Amplifier): GPIO%d\n", PA);
+    
+    // Basic I2S configuration for audio output
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-        .sample_rate = I2S_SAMPLE_RATE,
+        .sample_rate = 44100,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
         .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
@@ -379,167 +284,317 @@ void setupAudioOutput() {
     };
 
     i2s_pin_config_t pin_config = {
-        .bck_io_num = 9,
-        .ws_io_num = 45,
-        .data_out_num = 46,
+        .bck_io_num = I2S_BCK_IO,
+        .ws_io_num = I2S_WS_IO,
+        .data_out_num = I2S_DO_IO,
         .data_in_num = I2S_PIN_NO_CHANGE
     };
 
     esp_err_t result = i2s_driver_install(I2S_NUM_1, &i2s_config, 0, NULL);
     if (result == ESP_OK) {
-        Serial.println("Audio output I2S driver installed successfully!");
+        Serial.println("Audio I2S driver installed successfully!");
+        
+        result = i2s_set_pin(I2S_NUM_1, &pin_config);
+        if (result == ESP_OK) {
+            Serial.println("Audio I2S pins configured successfully!");
+        } else {
+            Serial.printf("Failed to configure audio I2S pins: %d\n", result);
+        }
     } else {
         Serial.printf("Failed to install audio I2S driver: %d\n", result);
     }
+    
+    Serial.println("=== End Audio Setup ===\n");
+}
 
-    result = i2s_set_pin(I2S_NUM_1, &pin_config);
-    if (result == ESP_OK) {
-        Serial.println("Audio output I2S pins configured successfully!");
-    } else {
-        Serial.printf("Failed to configure audio I2S pins: %d\n", result);
+void testTouchPins() {
+    Serial.println("=== Touch Pin Test ===");
+    Serial.printf("Touch SDA: GPIO%d\n", IIC_SDA);
+    Serial.printf("Touch SCL: GPIO%d\n", IIC_SCL);
+    Serial.printf("Touch INT: GPIO%d\n", TP_INT);
+    Serial.printf("Touch RESET: GPIO%d\n", TP_RESET);
+    
+    // Configure touch interrupt pin
+    pinMode(TP_INT, INPUT_PULLUP);
+    pinMode(TP_RESET, OUTPUT);
+    
+    // Reset touch controller
+    digitalWrite(TP_RESET, LOW);
+    delay(20);
+    digitalWrite(TP_RESET, HIGH);
+    delay(50);
+    
+    Serial.printf("Touch INT pin state: %s\n", digitalRead(TP_INT) ? "HIGH" : "LOW");
+    Serial.println("=== End Touch Test ===\n");
+}
+
+bool setupTensorFlowLite() {
+    Serial.println("=== TensorFlow Lite Model Setup ===");
+    Serial.printf("Model size: %d bytes\n", model_improved_int8_3_2_1_tflite_len);
+    Serial.printf("Tensor arena size: %d bytes\n", kTensorArenaSize);
+    Serial.printf("Input size: %d (frames: %d, features: %d)\n", kInputSize, kMfccFrames, kMfccFeatures);
+    Serial.printf("Output size: %d\n", kOutputSize);
+    
+    // Initialize TensorFlow Lite Micro
+    Serial.println("Calling tflite::InitializeTarget()...");
+    tflite::InitializeTarget();
+    Serial.println("tflite::InitializeTarget() done.");
+    
+    // Load the model
+    Serial.println("Loading model...");
+    model = tflite::GetModel(model_improved_int8_3_2_1_tflite);
+    if (!model) {
+        Serial.println("Model pointer is null!");
+        return false;
+    }
+    Serial.printf("Model loaded. model->version() = %d, TFLITE_SCHEMA_VERSION = %d\n", model->version(), TFLITE_SCHEMA_VERSION);
+    if (model->version() != TFLITE_SCHEMA_VERSION) {
+        Serial.printf("Model schema version %d not supported. Supported version is %d\n", 
+                     model->version(), TFLITE_SCHEMA_VERSION);
+        return false;
+    }
+    Serial.println("Model schema version OK.");
+    Serial.println("Model loaded successfully");
+    
+    // Create resolver with required operations
+    Serial.println("Creating op resolver...");
+    static tflite::MicroMutableOpResolver<10> resolver;
+    resolver.AddFullyConnected();
+    resolver.AddSoftmax();
+    resolver.AddRelu();
+    resolver.AddQuantize();
+    resolver.AddDequantize();
+    Serial.println("Op resolver created.");
+    
+    // Create interpreter
+    Serial.println("Creating MicroInterpreter...");
+    static tflite::MicroInterpreter static_interpreter(
+        model, resolver, tensor_arena, kTensorArenaSize);
+    interpreter = &static_interpreter;
+    Serial.println("MicroInterpreter created.");
+    
+    // Allocate tensors
+    Serial.println("Allocating tensors...");
+    TfLiteStatus allocate_status = interpreter->AllocateTensors();
+    if (allocate_status != kTfLiteOk) {
+        Serial.println("Failed to allocate tensors!");
+        return false;
+    }
+    Serial.println("Tensors allocated successfully");
+    
+    // Get input and output tensors
+    Serial.println("Getting input/output tensors...");
+    input = interpreter->input(0);
+    output = interpreter->output(0);
+    if (!input || !output) {
+        Serial.printf("Input or output tensor is null! input=%p, output=%p\n", input, output);
+        return false;
+    }
+    
+    // Print tensor information
+    Serial.printf("Input tensor: %d dimensions\n", input->dims->size);
+    for (int i = 0; i < input->dims->size; i++) {
+        Serial.printf("  Dim %d: %d\n", i, input->dims->data[i]);
+    }
+    Serial.printf("Input type: %d\n", input->type);
+    
+    Serial.printf("Output tensor: %d dimensions\n", output->dims->size);
+    for (int i = 0; i < output->dims->size; i++) {
+        Serial.printf("  Dim %d: %d\n", i, output->dims->data[i]);
+    }
+    Serial.printf("Output type: %d\n", output->type);
+    
+    // Print quantization parameters if quantized
+    if (input->type == kTfLiteInt8) {
+        Serial.printf("Input quantization - scale: %.6f, zero_point: %d\n", 
+                     input->params.scale, input->params.zero_point);
+    }
+    if (output->type == kTfLiteInt8) {
+        Serial.printf("Output quantization - scale: %.6f, zero_point: %d\n", 
+                     output->params.scale, output->params.zero_point);
+    }
+    
+    model_initialized = true;
+    Serial.println("=== TensorFlow Lite Setup Complete ===\n");
+    return true;
+}
+
+void generateDummyMfccData() {
+    // Generate dummy MFCC data similar to what your model expects
+    // This simulates normalized MFCC features
+    Serial.println("Generating dummy MFCC data...");
+    
+    for (int frame = 0; frame < kMfccFrames; frame++) {
+        for (int coeff = 0; coeff < kMfccFeatures; coeff++) {
+            // Generate some pseudo-random but realistic MFCC values
+            float dummy_value = sin(frame * 0.1 + coeff * 0.3) * 0.5; // Range: -0.5 to 0.5
+            
+            int index = frame * kMfccFeatures + coeff;
+            
+            // Handle different input tensor types
+            if (input->type == kTfLiteFloat32) {
+                input->data.f[index] = dummy_value;
+            } else if (input->type == kTfLiteInt8) {
+                // Quantize to int8
+                float scale = input->params.scale;
+                int zero_point = input->params.zero_point;
+                int8_t quantized = (int8_t)((dummy_value / scale) + zero_point);
+                input->data.int8[index] = quantized;
+            }
+        }
+    }
+    
+    Serial.printf("Generated %d MFCC values\n", kMfccFrames * kMfccFeatures);
+    if (input->type == kTfLiteFloat32) {
+        Serial.printf("Sample values (float32): [%.3f, %.3f, %.3f, %.3f, %.3f]\n", 
+                     input->data.f[0], input->data.f[1], input->data.f[2], input->data.f[3], input->data.f[4]);
+    } else if (input->type == kTfLiteInt8) {
+        Serial.printf("Sample values (int8): [%d, %d, %d, %d, %d]\n", 
+                     input->data.int8[0], input->data.int8[1], input->data.int8[2], input->data.int8[3], input->data.int8[4]);
     }
 }
 
-void setupMicrophone() {
-    i2s_config_t i2s_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-        .sample_rate = MIC_I2S_SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 8,
-        .dma_buf_len = 64,
-        .use_apll = false,
-        .tx_desc_auto_clear = false,
-        .fixed_mclk = 0
-    };
-
-    i2s_pin_config_t pin_config = {
-        .bck_io_num = 41,
-        .ws_io_num = 42,
-        .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num = 2
-    };
-
-    esp_err_t result = i2s_driver_install(MIC_I2S_PORT, &i2s_config, 0, NULL);
-    if (result == ESP_OK) {
-        Serial.println("Microphone I2S driver installed successfully!");
-    } else {
-        Serial.printf("Failed to install microphone I2S driver: %d\n", result);
+float runInference() {
+    if (!model_initialized) {
+        Serial.println("Model not initialized!");
+        return -1.0f;
     }
-
-    result = i2s_set_pin(MIC_I2S_PORT, &pin_config);
-    if (result == ESP_OK) {
-        Serial.println("Microphone I2S pins configured successfully!");
-    } else {
-        Serial.printf("Failed to configure microphone I2S pins: %d\n", result);
+    
+    Serial.println("=== Running Inference ===");
+    
+    // Generate dummy MFCC input data
+    generateDummyMfccData();
+    
+    // Run inference
+    unsigned long start_time = micros();
+    TfLiteStatus invoke_status = interpreter->Invoke();
+    unsigned long inference_time = micros() - start_time;
+    
+    if (invoke_status != kTfLiteOk) {
+        Serial.println("Inference failed!");
+        return -1.0f;
     }
+    
+    // Get prediction and handle different output types
+    float prediction = 0.0f;
+    if (output->type == kTfLiteFloat32) {
+        prediction = output->data.f[0];
+    } else if (output->type == kTfLiteInt8) {
+        // Dequantize int8 output
+        int8_t output_quantized = output->data.int8[0];
+        float scale = output->params.scale;
+        int zero_point = output->params.zero_point;
+        prediction = (output_quantized - zero_point) * scale;
+    }
+    
+    Serial.printf("Inference completed in %lu microseconds\n", inference_time);
+    Serial.printf("Prediction: %.4f liters\n", prediction);
+    Serial.println("=== End Inference ===\n");
+    
+    return prediction;
 }
 
 void setup() {
     Serial.begin(115200);
     delay(2000);
+    boot_time = millis();
     
-    Serial.println("=== ESP32-S3 Touch AMOLED 1.75-B LVGL Demo Starting ===");
+    Serial.println("======================================");
+    Serial.println("ESP32-S3 Touch AMOLED 1.75-B Hardware Test");
+    Serial.println("Reverted to Working Configuration");
+    Serial.println("======================================\n");
     
     // Check PSRAM
-    Serial.println("DEBUG: Checking PSRAM...");
+    Serial.println("=== Memory Check ===");
     if (psramFound()) {
-        Serial.printf("DEBUG: PSRAM found: %d bytes\n", ESP.getPsramSize());
+        Serial.printf("PSRAM found: %d bytes\n", ESP.getPsramSize());
+        Serial.printf("Free PSRAM: %d bytes\n", ESP.getFreePsram());
     } else {
-        Serial.println("WARNING: PSRAM not found!");
+        Serial.println("PSRAM not found!");
     }
+    Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+    Serial.printf("CPU frequency: %d MHz\n", ESP.getCpuFreqMHz());
+    Serial.println("=== End Memory Check ===\n");
     
-    // Check free memory
-    Serial.printf("DEBUG: Free heap: %d bytes\n", ESP.getFreeHeap());
+    // Test each hardware component
+    scanI2CDevices();
+    setupQSPIDisplay();
+    testTouchPins();
+    setupAudio();
     
-    // LCD INITIALIZATION DISABLED FOR DEBUGGING
-    Serial.println("=== STEP 1: LCD INITIALIZATION DISABLED ===");
-    Serial.println("LCD initialization skipped to avoid crashes");
-    Serial.println("Using serial debug mode only");
-    
+    // Initialize and test the display
     /*
-    // Initialize display (DISABLED - causing crashes)
-    Serial.println("=== STEP 1: Initializing display ===");
-    setupDisplay();
-    Serial.println("=== STEP 1: Display setup completed ===");
-    
-    // Skip LVGL for now to test basic display
-    Serial.println("=== STEP 2: LVGL DISABLED FOR TESTING ===");
-    Serial.println("Testing basic display functionality only...");
-    
-    // Test basic display drawing
-    Serial.println("Testing basic display operations...");
-    tft.fillScreen(TFT_BLUE);
-    delay(1000);
-    tft.fillScreen(TFT_RED);
-    delay(1000);
-    tft.fillScreen(TFT_GREEN);
-    delay(1000);
-    tft.fillScreen(TFT_BLACK);
-    
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setTextSize(2);
-    tft.drawString("ESP32-S3", 50, 100);
-    tft.drawString("AMOLED Test", 50, 130);
-    tft.drawString("Display OK!", 50, 160);
-    Serial.println("Basic display test completed!");
-    
-    // Initialize LVGL (disabled for testing)
-    Serial.println("=== STEP 2: Initializing LVGL ===");
-    setupLVGL();
-    Serial.println("=== STEP 2: LVGL setup completed ===");
-    
-    // Create UI
-    Serial.println("=== STEP 3: Creating UI ===");
-    createUI();
-    Serial.println("=== STEP 3: UI creation completed ===");
+    if (display_initialized) {
+        initializeDisplay();
+        
+        Serial.println("Testing display with color fills...");
+        fillScreen(0xF800); // Red
+        delay(2000);
+        fillScreen(0x07E0); // Green
+        delay(2000);
+        fillScreen(0x001F); // Blue
+        delay(2000);
+        fillScreen(0x0000); // Black
+        delay(1000);
+        
+        Serial.println("Testing basic drawing...");
+        testBasicDrawing();
+        delay(2000);
+    }
     */
     
-    // Initialize audio (optional)
-    Serial.println("=== STEP 4: Initializing audio ===");
-    setupAudioOutput();
-    setupMicrophone();
-    Serial.println("=== STEP 4: Audio setup completed ===");
-    
-    Serial.println("=== ALL SETUP COMPLETE ===");
-    Serial.println("Touch the screen to interact with the demo!");
-    Serial.printf("DEBUG: Final free heap: %d bytes\n", ESP.getFreeHeap());
+    Serial.println("======================================");
+    Serial.println("Hardware test completed successfully!");
+    Serial.println("All pins configured and tested.");
+    Serial.println("Check serial output for device detection.");
+    Serial.println("======================================\n");
 }
 
 void loop() {
-    // LCD DISABLED - Serial debug mode only
-    
-    // Print periodic status every 5 seconds
-    static unsigned long last_status = 0;
-    if (millis() - last_status > 5000) {
-        Serial.printf("=== SYSTEM STATUS ===\r\n");
-        Serial.printf("Uptime: %lu ms\r\n", millis());
-        Serial.printf("Free heap: %d bytes\r\n", ESP.getFreeHeap());
-        Serial.printf("PSRAM free: %d bytes\r\n", ESP.getFreePsram());
-        Serial.printf("CPU frequency: %d MHz\r\n", ESP.getCpuFreqMHz());
-        Serial.printf("Flash size: %d bytes\r\n", ESP.getFlashChipSize());
-        Serial.printf("=== END STATUS ===\r\n\r\n");
+    static bool tflite_attempted = false;
+    if (!tflite_attempted) {
+        Serial.println("[loop] About to call setupTensorFlowLite()");
+        bool ok = setupTensorFlowLite();
+        Serial.printf("[loop] setupTensorFlowLite() returned: %s\n", ok ? "true" : "false");
+        tflite_attempted = true;
+    }
+    // Print status every 10 seconds
+    if (millis() - last_status > 10000) {
+        unsigned long uptime = millis() - boot_time;
+        
+        // Calculate memory usage
+        uint32_t total_heap = ESP.getHeapSize();
+        uint32_t free_heap = ESP.getFreeHeap();
+        uint32_t used_heap = total_heap - free_heap;
+        float ram_usage = (float)used_heap / total_heap * 100.0;
+        
+        // Calculate flash usage
+        uint32_t sketch_size = ESP.getSketchSize();
+        uint32_t total_flash = ESP.getFlashChipSize();
+        float flash_usage = (float)sketch_size / total_flash * 100.0;
+        
+        Serial.println("=== System Status ===");
+        Serial.printf("Uptime: %lu ms (%.1f seconds)\n", uptime, uptime / 1000.0);
+        Serial.printf("RAM Usage: %.1f%% (%d / %d bytes)\n", ram_usage, used_heap, total_heap);
+        Serial.printf("Flash Usage: %.1f%% (%d / %d bytes)\n", flash_usage, sketch_size, total_flash);
+        Serial.printf("Free PSRAM: %d bytes\n", ESP.getFreePsram());
+        Serial.printf("Touch INT pin: %s\n", digitalRead(TP_INT) ? "HIGH" : "LOW");
+        Serial.printf("Display initialized: %s\n", display_initialized ? "YES" : "NO");
+        Serial.printf("TFLite model initialized: %s\n", model_initialized ? "YES" : "NO");
+        
+        // Run periodic inference test
+        if (model_initialized && (uptime > 30000)) { // After 30 seconds of uptime
+            Serial.println("Running periodic TensorFlow Lite inference test...");
+            float prediction = runInference();
+            if (prediction >= 0) {
+                Serial.printf("Periodic test - Predicted: %.4f liters\n", prediction);
+            }
+        }
+        
+        Serial.println("=== End Status ===\n");
+        
         last_status = millis();
     }
     
-    /*
-    // LVGL and touch code (disabled)
-    // Handle LVGL tasks
-    lv_timer_handler();
-    
-    // Test touch functionality directly
-    uint16_t x, y;
-    boolean touched = tft.getTouch(&x, &y);
-    
-    if (touched) {
-        Serial.printf("Touch detected: X=%d, Y=%d\n", x, y);
-        // Draw a small circle where touched
-        tft.fillCircle(x, y, 5, TFT_YELLOW);
-    }
-    */
-    
-    delay(100); // Small delay
-    Serial.printf("Hello World\r\n");
+    delay(1000); // 1 second delay
 }
