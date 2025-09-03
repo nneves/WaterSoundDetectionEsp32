@@ -1,0 +1,68 @@
+Test 1: Test 1 MFCC (before norm) - Min: -0.0012, Max: 0.0011, Mean: 0.0000, Range: 0.0023
+Test 1: Test 1 MFCC (after norm) - Min: -0.0120, Max: 0.0110, Mean: 0.0000, Range: 0.0230
+Test 1: Test 1 Quantized - Min: -2, Max: 1, Scale: 0.007843, Zero: -1
+Test 1: Low flow simulation - Prediction: 0.2200 liters
+
+Test 2: Test 2 MFCC (before norm) - Min: -0.0456, Max: 0.0432, Mean: 0.0001, Range: 0.0888
+Test 2: Test 2 MFCC (after norm) - Min: -0.4560, Max: 0.4320, Mean: 0.0010, Range: 0.8880
+Test 2: Test 2 Quantized - Min: -58, Max: 55, Scale: 0.007843, Zero: -1
+Test 2: Medium flow simulation - Prediction: 1.5000 liters
+
+Test 3: Test 3 MFCC (before norm) - Min: -0.1234, Max: 0.1187, Mean: 0.0002, Range: 0.2421
+Test 3: Test 3 MFCC (after norm) - Min: -1.0000, Max: 1.0000, Mean: 0.0020, Range: 2.0000
+Test 3: Test 3 Quantized - Min: -128, Max: 127, Scale: 0.007843, Zero: -1
+Test 3: High flow simulation - Prediction: 3.2000 liters
+
+---
+
+
+Water prediction model ready. Press 'p' to predict or 't' to test with mock audio.
+Loading...
+======================================
+ESP32-S3 Touch AMOLED 1.75-B Hardware Test
+======================================
+
+=== Memory Check ===
+PSRAM found: 8.00 MB
+Free PSRAM: 8.00 MB
+Free heap: 84.37 KB
+CPU frequency: 240 MHz
+=== End Memory Check ===
+
+Loading complete
+=== Water Consumption Prediction ===
+Free heap before processing: 86396 bytes
+Generating mock audio data...
+Extracting MFCC features...
+Running inference...
+=== Prediction Results ===
+Predicted water consumption: 0.3226 liters
+Input scale: 0.007843
+Input zero point: -1
+Output scale: 0.001473
+Output zero point: -128
+========================
+
+Unknown command. Press 'h' for help.
+=== Testing with Mock Audio ===
+Test 1: Test 1 MFCC (before norm) - Min: -0.0002, Max: 0.0002, Mean: -0.0000, Range: 0.0004
+Test 1 MFCC (after norm) - Min: -0.0019, Max: 0.0019, Mean: -0.0000, Range: 0.0039
+Test 1 Quantized - Min: -1, Max: -1, Scale: 0.007843, Zero: -1
+Low flow simulation - Prediction: 0.2887 liters
+Test 2: Test 2 MFCC (before norm) - Min: -0.0077, Max: 0.0083, Mean: -0.0000, Range: 0.0159
+Test 2 MFCC (after norm) - Min: -0.0769, Max: 0.0826, Mean: -0.0000, Range: 0.1595
+Test 2 Quantized - Min: -11, Max: 10, Scale: 0.007843, Zero: -1
+Medium flow simulation - Prediction: 0.2828 liters
+Test 3: Test 3 MFCC (before norm) - Min: -0.0934, Max: 0.0901, Mean: -0.0000, Range: 0.1835
+Test 3 MFCC (after norm) - Min: -0.9335, Max: 0.9013, Mean: -0.0004, Range: 1.8348
+Test 3 Quantized - Min: -120, Max: 114, Scale: 0.007843, Zero: -1
+High flow simulation - Prediction: 0.3226 liters
+========================
+
+=== System Status ===
+Uptime: 35280 ms (35.3 seconds)
+RAM Usage: 29.4% (35.00 KB / 119.14 KB)
+Flash Usage: 3.5% (0.57 MB / 16.00 MB)
+Free PSRAM: 8.00 MB
+=== End Status ===
+
