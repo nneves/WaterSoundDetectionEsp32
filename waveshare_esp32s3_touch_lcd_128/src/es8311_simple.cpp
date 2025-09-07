@@ -26,7 +26,7 @@ bool ES8311::begin(uint8_t sda, uint8_t scl, uint32_t sampleRate, uint8_t volume
     Serial.println("[ES8311] begin()");
     _wire->begin(sda, scl);
     _mclk_hz = mclk_hz;
-    Serial.printf("[ES8311] Using MCLK: %lu Hz\n", (unsigned long)_mclk_hz);
+    Serial.printf("[ES8311] Using MCLK: %lu Hz\r\n", (unsigned long)_mclk_hz);
     reset();
     configureClock(sampleRate);
     configureFormat();
@@ -96,18 +96,18 @@ void ES8311::configureVolume(uint8_t volume) {
 void ES8311::setVolume(uint8_t volume) {
     if (volume > 100) volume = 100;
     uint8_t reg = (volume == 0) ? 0 : ((volume * 256) / 100) - 1;
-    Serial.printf("[ES8311] setVolume: %d (reg=0x%02X)\n", volume, reg);
+    Serial.printf("[ES8311] setVolume: %d (reg=0x%02X)\r\n", volume, reg);
     writeReg(ES8311_DAC_REG32, reg);
 }
 
 void ES8311::setMicGain(uint8_t gain) {
     if (gain > 7) gain = 7;
-    Serial.printf("[ES8311] setMicGain: %d\n", gain);
+    Serial.printf("[ES8311] setMicGain: %d\r\n", gain);
     writeReg(ES8311_ADC_REG16, gain);
 }
 
 void ES8311::power(bool enable) {
-    Serial.printf("[ES8311] power: %s\n", enable ? "ON" : "OFF");
+    Serial.printf("[ES8311] power: %s\r\n", enable ? "ON" : "OFF");
     if (enable) {
         writeReg(ES8311_SYSTEM_REG0D, 0x01);
     } else {
@@ -120,7 +120,7 @@ bool ES8311::writeReg(uint8_t reg, uint8_t val) {
     _wire->write(reg);
     _wire->write(val);
     bool ok = (_wire->endTransmission() == 0);
-    Serial.printf("[ES8311] writeReg: 0x%02X = 0x%02X %s\n", reg, val, ok ? "OK" : "FAIL");
+    Serial.printf("[ES8311] writeReg: 0x%02X = 0x%02X %s\r\n", reg, val, ok ? "OK" : "FAIL");
     return ok;
 }
 
@@ -128,14 +128,14 @@ bool ES8311::readReg(uint8_t reg, uint8_t &val) {
     _wire->beginTransmission(_addr);
     _wire->write(reg);
     if (_wire->endTransmission(false) != 0) {
-        Serial.printf("[ES8311] readReg: 0x%02X NACK\n", reg);
+        Serial.printf("[ES8311] readReg: 0x%02X NACK\r\n", reg);
         return false;
     }
     if (_wire->requestFrom(_addr, (uint8_t)1) != 1) {
-        Serial.printf("[ES8311] readReg: 0x%02X no data\n", reg);
+        Serial.printf("[ES8311] readReg: 0x%02X no data\r\n", reg);
         return false;
     }
     val = _wire->read();
-    Serial.printf("[ES8311] readReg: 0x%02X = 0x%02X\n", reg, val);
+    Serial.printf("[ES8311] readReg: 0x%02X = 0x%02X\r\n", reg, val);
     return true;
 }

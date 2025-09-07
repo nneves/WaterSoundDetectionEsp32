@@ -22,8 +22,8 @@ extern "C" {
 }
 #endif
 
-#define I2C_SDA 15
 #define I2C_SCL 14
+#define I2C_SDA 15
 #define ES8311_I2C_PORT 0
 #define ES8311_I2C_ADDR 0x18
 
@@ -66,11 +66,11 @@ int8_t quantized_input[N_MFCC * MAX_SEQUENCE_LENGTH];
 
 // I2S configuration for ES8311 mic (update pins as needed for your board)
 #define I2S_NUM         I2S_NUM_0
-#define I2S_BCK_IO      9   // Bit Clock (SCLK)
-#define I2S_WS_IO       45  // Word Select (LRCK)
 #define I2S_DI_IO       8   // Data In (from mic, DSDIN)
+#define I2S_BCK_IO      9   // Bit Clock (SCLK)
 #define I2S_DO_IO       10  // Data Out (to speaker, ASDOUT)
 #define I2S_MCK_IO      42  // Master Clock (MCLK)
+#define I2S_WS_IO       45  // Word Select (LRCK)
 #define PA_CTRL         46  // Power Amplifier Enable
 
 // Buffer for raw audio samples
@@ -419,10 +419,23 @@ void showHelp() {
     Serial.println("=== Water Prediction Model Commands ===");
     Serial.println("'p' or 'P' - Perform water prediction with mock audio");
     Serial.println("'t' or 'T' - Test with different mock audio patterns");
-    Serial.println("'m' or 'M' - Check memory usage");
+    Serial.println("'m' - Check memory usage");
     Serial.println("'a' or 'A' - Sample microphone and print audio stats");
     Serial.println("'r' or 'R' - Play back last microphone sample to output");
     Serial.println("'s' or 'S' - Generate and play 1kHz test tone");
+    Serial.println("'e' or 'E' - Enable PA_CTRL (amplifier)");
+    Serial.println("'d' or 'D' - Disable PA_CTRL (amplifier)");
+    Serial.println("'w' or 'W' - Power ON ES8311 codec");
+    Serial.println("'x' or 'X' - Power OFF ES8311 codec");
+    Serial.println("'M' - Set I2S to MONO output");
+    Serial.println("'S' - Set I2S to STEREO output");
+    Serial.println("'1' - Set MCLK to 4096000 (256x)");
+    Serial.println("'2' - Set MCLK to 6144000 (384x)");
+    Serial.println("'c' - Toggle continuous sine playback");
+    Serial.println("'+' - Increase volume");
+    Serial.println("'-' - Decrease volume");
+    Serial.println("'*' - Increase mic gain");
+    Serial.println("'/' - Decrease mic gain");
     Serial.println("'h' or 'H' - Show this help message");
     Serial.println("=====================================\n");
 }
@@ -476,8 +489,12 @@ void initI2SMic() {
         .data_out_num = I2S_DO_IO,
         .data_in_num = I2S_DI_IO
     };
-    i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
-    i2s_set_pin(I2S_NUM, &pin_config);
+    Serial.printf("I2S pin config: BCK=%d, WS=%d, DO=%d, DI=%d\r\n", I2S_BCK_IO, I2S_WS_IO, I2S_DO_IO, I2S_DI_IO);
+    esp_err_t err;
+    err = i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
+    Serial.printf("i2s_driver_install: %s\r\n", (err == ESP_OK ? "OK" : "FAIL"));
+    err = i2s_set_pin(I2S_NUM, &pin_config);
+    Serial.printf("i2s_set_pin: %s\r\n", (err == ESP_OK ? "OK" : "FAIL"));
     i2s_set_clk(I2S_NUM, 16000, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
 }
 
@@ -530,13 +547,81 @@ void fillBufferWithSine(float freq) {
     Serial.printf("Filled buffer with %.1f Hz sine wave\r\n", freq);
 }
 
+void setI2SMode(bool mono) {
+    bool i2sMono = mono;
+    i2s_driver_uninstall(I2S_NUM);
+    i2s_config_t i2s_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_TX),
+        .sample_rate = 16000,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = mono ? I2S_CHANNEL_FMT_ONLY_LEFT : I2S_CHANNEL_FMT_RIGHT_LEFT,
+        .communication_format = I2S_COMM_FORMAT_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 4,
+        .dma_buf_len = 256,
+        .use_apll = false,
+        .tx_desc_auto_clear = true,
+        .fixed_mclk = 0
+    };
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = I2S_BCK_IO,
+        .ws_io_num = I2S_WS_IO,
+        .data_out_num = I2S_DO_IO,
+        .data_in_num = I2S_DI_IO
+    };
+    Serial.printf("I2S pin config: BCK=%d, WS=%d, DO=%d, DI=%d\n", I2S_BCK_IO, I2S_WS_IO, I2S_DO_IO, I2S_DI_IO);
+    esp_err_t err;
+    err = i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
+    Serial.printf("i2s_driver_install: %s\n", (err == ESP_OK ? "OK" : "FAIL"));
+    err = i2s_set_pin(I2S_NUM, &pin_config);
+    Serial.printf("i2s_set_pin: %s\n", (err == ESP_OK ? "OK" : "FAIL"));
+    i2s_set_clk(I2S_NUM, 16000, I2S_BITS_PER_SAMPLE_16BIT, mono ? I2S_CHANNEL_MONO : I2S_CHANNEL_STEREO);
+    Serial.printf("I2S mode set to %s\n", mono ? "MONO" : "STEREO");
+}
+
+void setMCLK(int mclk) {
+    int currentMclk = mclk;
+    codec.begin(I2C_SDA, I2C_SCL, 16000, 90, 3, currentMclk);
+    Serial.printf("MCLK set to %d\r\n", currentMclk);
+}
+
+void setVolumeFromString(const String& inputValue) {
+    String vstr = inputValue.substring(1);
+    vstr.trim();
+    int v = vstr.toInt();
+    if (v >= 0 && v <= 100) {
+        codec.setVolume(v);
+        Serial.printf("Volume set to %d\n", v);
+    } else {
+        Serial.printf("Invalid volume value (%d, should be 0-100)\n", v);
+    }
+}
+
+void setGainFromString(const String& inputValue) {
+    String gstr = inputValue.substring(1);
+    gstr.trim();
+    int g = gstr.toInt();
+    if (g >= 0 && g <= 7) {
+        codec.setMicGain(g);
+        Serial.printf("Mic gain set to %d\n", g);
+    } else {
+        Serial.printf("Invalid mic gain value (%d, should be 0-7)\n", g);
+    }
+}
+
+unsigned long lastSine = 0;
+bool continuousSine = false;
+int currentMclk = 6144000; // Default to 384x
+bool i2sMono = false;
+int currentVolume = 90;
+int currentGain = 3;
 void setup() {
     Serial.begin(115200);
     while(!Serial);
     // Enable power amplifier
     pinMode(PA_CTRL, OUTPUT);
     digitalWrite(PA_CTRL, HIGH);
-    Serial.printf("PA_CTRL (GPIO%d) set HIGH\n", PA_CTRL);
+    Serial.printf("PA_CTRL (GPIO%d) set HIGH\r\n", PA_CTRL);
   
     Serial.println("Water Consumption Prediction Model");
     Serial.println("Initializing TensorFlow Lite Micro Interpreter...");
@@ -545,12 +630,12 @@ void setup() {
     // copying or parsing, it's a very lightweight operation.
     model = tflite::GetModel(model_improved_int8_3_2_1_tflite);
     
-    Serial.printf("Model loaded successfully. Size: %d bytes\n", model_improved_int8_3_2_1_tflite_len);
+    Serial.printf("Model loaded successfully. Size: %d bytes\r\n", model_improved_int8_3_2_1_tflite_len);
   
     // Check if model and library have compatible schema version,
     // if not, there is a misalignement between TensorFlow version used
     // to train and generate the TFLite model and the current version of library
-    Serial.printf("Model version: %d, Library version: %d\n", model->version(), TFLITE_SCHEMA_VERSION);
+    Serial.printf("Model version: %d, Library version: %d\r\n", model->version(), TFLITE_SCHEMA_VERSION);
     if (model->version() != TFLITE_SCHEMA_VERSION) {
       Serial.println("Model provided and schema version are not equal!");
       while(true); // stop program here
@@ -568,7 +653,7 @@ void setup() {
     // if an error occurs, stop the program.
     TfLiteStatus allocate_status = interpreter->AllocateTensors();
     if (allocate_status != kTfLiteOk) {
-      Serial.println("AllocateTensors() failed");
+      Serial.println("AllocateTensors() failed\r\n");
       while(true); // stop program here
     }
     
@@ -627,28 +712,21 @@ void loop() {
         loading = false;
         Serial.println("Press 'h' for help.");
     }
-
-    // Print status every 30 seconds
-    /*
-    if (millis() - last_status > 30000) {
-        checkMemory();
-        last_status = millis();
+    // Continuous sine playback
+    if (continuousSine && millis() - lastSine > 10) {
+        fillBufferWithSine(1000.0f);
+        size_t bytes_written = 0;
+        i2s_write(I2S_NUM, mic_buffer, MIC_SAMPLE_COUNT * sizeof(int16_t), &bytes_written, portMAX_DELAY);
+        lastSine = millis();
     }
-    */
-
-    // Check for serial input
     if (Serial.available()) {
         String inputValue = Serial.readStringUntil('\n');
         inputValue.trim();
-        
         if (inputValue == "p" || inputValue == "P") {
-            // Perform water prediction with mock audio
             performWaterPrediction();
         } else if (inputValue == "t" || inputValue == "T") {
-            // Test with mock audio
             testWithMockAudio();
-        } else if (inputValue == "m" || inputValue == "M") {
-            // Check memory usage
+        } else if (inputValue == "m") {
             checkMemoryUsage();
         } else if (inputValue == "a" || inputValue == "A") {
             sampleMicAndPrintStats();
@@ -663,8 +741,44 @@ void loop() {
         } else if (inputValue == "d" || inputValue == "D") {
             digitalWrite(PA_CTRL, LOW);
             Serial.println("PA_CTRL disabled (LOW)");
+        } else if (inputValue == "w" || inputValue == "W") {
+            codec.power(true);
+            Serial.println("ES8311 codec powered ON");
+        } else if (inputValue == "x" || inputValue == "X") {
+            codec.power(false);
+            Serial.println("ES8311 codec powered OFF");
+        } else if (inputValue == "M") {
+            setI2SMode(true);
+        } else if (inputValue == "S") {
+            setI2SMode(false);
+        } else if (inputValue == "1") {
+            setMCLK(4096000);
+        } else if (inputValue == "2") {
+            setMCLK(6144000);
+        } else if (inputValue == "c") {
+            continuousSine = !continuousSine;
+            Serial.printf("Continuous sine playback %s\n", continuousSine ? "ENABLED" : "DISABLED");
+        } else if (inputValue == "+") {
+            currentVolume += 5;
+            if (currentVolume > 100) currentVolume = 100;
+            codec.setVolume(currentVolume);
+            Serial.printf("Volume increased to %d\n", currentVolume);
+        } else if (inputValue == "-") {
+            currentVolume -= 5;
+            if (currentVolume < 0) currentVolume = 0;
+            codec.setVolume(currentVolume);
+            Serial.printf("Volume decreased to %d\n", currentVolume);
+        } else if (inputValue == "*") {
+            currentGain += 1;
+            if (currentGain > 7) currentGain = 7;
+            codec.setMicGain(currentGain);
+            Serial.printf("Mic gain increased to %d\n", currentGain);
+        } else if (inputValue == "/") {
+            currentGain -= 1;
+            if (currentGain < 0) currentGain = 0;
+            codec.setMicGain(currentGain);
+            Serial.printf("Mic gain decreased to %d\n", currentGain);
         } else if (inputValue == "h" || inputValue == "H") {
-            // Show help
             showHelp();
         } else {
             Serial.println("Unknown command. Press 'h' for help.");
