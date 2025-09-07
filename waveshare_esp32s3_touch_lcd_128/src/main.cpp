@@ -13,6 +13,19 @@
 #include "tensorflow/lite/micro/all_ops_resolver.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/schema/schema_generated.h"
+#include "driver/i2s.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+#include "es8311_simple.hpp"
+#ifdef __cplusplus
+}
+#endif
+
+#define I2C_SDA 15
+#define I2C_SCL 14
+#define ES8311_I2C_PORT 0
+#define ES8311_I2C_ADDR 0x18
 
 // Globals pointers, used to address TensorFlow Lite components.
 // Pointers are not usual in Arduino sketches, future versions of
@@ -28,7 +41,7 @@ TfLiteTensor* output = nullptr;
 // to store tensors and intermediate results
 // Increased size for 70KB water prediction model with MFCC features
 // Model size + intermediate tensors + working memory
-constexpr int kTensorArenaSize = 58 * 1024;  // 140KB for model operations
+constexpr int kTensorArenaSize = 50 * 1024; // 58 * 1024;  // 140KB for model operations
 
 // Keep aligned to 16 bytes for CMSIS (Cortex Microcontroller Software Interface Standard)
 // alignas(16) directive is used to specify that the array 
@@ -51,6 +64,19 @@ float audio_buffer[SAMPLES_PER_CHUNK];
 float mfcc_buffer[N_MFCC * MAX_SEQUENCE_LENGTH];
 int8_t quantized_input[N_MFCC * MAX_SEQUENCE_LENGTH];
 
+// I2S configuration for ES8311 mic (update pins as needed for your board)
+#define I2S_NUM         I2S_NUM_0
+#define I2S_BCK_IO      9   // Bit Clock (SCLK)
+#define I2S_WS_IO       45  // Word Select (LRCK)
+#define I2S_DI_IO       8   // Data In (from mic, DSDIN)
+#define I2S_DO_IO       10  // Data Out (to speaker, ASDOUT)
+#define I2S_MCK_IO      42  // Master Clock (MCLK)
+#define PA_CTRL         46  // Power Amplifier Enable
+
+// Buffer for raw audio samples
+#define MIC_SAMPLE_COUNT 48000  // 3 seconds at 16kHz
+static int16_t *mic_buffer = nullptr;
+
 // Function declarations
 void extractMFCCFeatures(float* audio_data, int audio_length, float* mfcc_output);
 void normalizeMFCC(float* mfcc_data, int length);
@@ -62,6 +88,12 @@ void testWithMockAudio();
 void checkMemoryUsage();
 void showHelp();
 void printMFCCStats(float* mfcc_data, int length, const char* label);
+void initI2SMic();
+void sampleMicAndPrintStats();
+void playMicSample();
+void fillBufferWithSine(float freq);
+// Global ES8311 object
+ES8311 codec;
 
 // Enhanced MFCC-like feature extraction with better frequency analysis
 void extractMFCCFeatures(float* audio_data, int audio_length, float* mfcc_output) {
@@ -388,6 +420,9 @@ void showHelp() {
     Serial.println("'p' or 'P' - Perform water prediction with mock audio");
     Serial.println("'t' or 'T' - Test with different mock audio patterns");
     Serial.println("'m' or 'M' - Check memory usage");
+    Serial.println("'a' or 'A' - Sample microphone and print audio stats");
+    Serial.println("'r' or 'R' - Play back last microphone sample to output");
+    Serial.println("'s' or 'S' - Generate and play 1kHz test tone");
     Serial.println("'h' or 'H' - Show this help message");
     Serial.println("=====================================\n");
 }
@@ -420,9 +455,88 @@ void printMFCCStats(float* mfcc_data, int length, const char* label) {
                   label, min_val, max_val, mean, range);
 }
 
+void initI2SMic() {
+    // I2S config structure
+    i2s_config_t i2s_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_TX), // Enable both RX and TX
+        .sample_rate = 16000,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT, // Stereo mode
+        .communication_format = I2S_COMM_FORMAT_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 4,
+        .dma_buf_len = 256,
+        .use_apll = false,
+        .tx_desc_auto_clear = true,
+        .fixed_mclk = 0
+    };
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = I2S_BCK_IO,
+        .ws_io_num = I2S_WS_IO,
+        .data_out_num = I2S_DO_IO,
+        .data_in_num = I2S_DI_IO
+    };
+    i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
+    i2s_set_pin(I2S_NUM, &pin_config);
+    i2s_set_clk(I2S_NUM, 16000, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
+}
+
+void sampleMicAndPrintStats() {
+    size_t total_bytes_read = 0, bytes_read = 0;
+    // Clear buffer
+    memset(mic_buffer, 0, MIC_SAMPLE_COUNT * sizeof(int16_t));
+    // Read samples from I2S in a loop until buffer is full
+    while (total_bytes_read < MIC_SAMPLE_COUNT * sizeof(int16_t)) {
+        i2s_read(I2S_NUM, (void*)((uint8_t*)mic_buffer + total_bytes_read),
+                 (MIC_SAMPLE_COUNT * sizeof(int16_t)) - total_bytes_read,
+                 &bytes_read, portMAX_DELAY);
+        total_bytes_read += bytes_read;
+    }
+    int sample_count = total_bytes_read / sizeof(int16_t);
+    // Calculate stats
+    int16_t min_val = mic_buffer[0];
+    int16_t max_val = mic_buffer[0];
+    int64_t sum = 0;
+    for (int i = 0; i < sample_count; i++) {
+        if (mic_buffer[i] < min_val) min_val = mic_buffer[i];
+        if (mic_buffer[i] > max_val) max_val = mic_buffer[i];
+        sum += mic_buffer[i];
+    }
+    float mean = (float)sum / sample_count;
+    Serial.println("=== Microphone Sample Stats ===");
+    Serial.printf("Samples: %d\r\n", sample_count);
+    Serial.printf("Min: %d, Max: %d, Mean: %.2f\r\n", min_val, max_val, mean);
+    Serial.printf("Duration: %.3f seconds\r\n", (float)sample_count / 16000.0f);
+    Serial.println("==============================\n");
+}
+
+void playMicSample() {
+    if (!mic_buffer) {
+        Serial.println("No microphone sample recorded!");
+        return;
+    }
+    size_t bytes_written = 0;
+    Serial.println("Playing back recorded microphone sample...");
+    i2s_write(I2S_NUM, mic_buffer, MIC_SAMPLE_COUNT * sizeof(int16_t), &bytes_written, portMAX_DELAY);
+    Serial.printf("Played %d samples (%.2f seconds) to output\r\n", (int)(bytes_written / 2), (float)(bytes_written / 2) / 16000.0f);
+}
+
+void fillBufferWithSine(float freq) {
+    if (!mic_buffer) return;
+    for (int i = 0; i < MIC_SAMPLE_COUNT; i++) {
+        float t = (float)i / 16000.0f;
+        mic_buffer[i] = (int16_t)(16000 * sinf(2.0f * PI * freq * t)); // amplitude: 16000
+    }
+    Serial.printf("Filled buffer with %.1f Hz sine wave\r\n", freq);
+}
+
 void setup() {
     Serial.begin(115200);
     while(!Serial);
+    // Enable power amplifier
+    pinMode(PA_CTRL, OUTPUT);
+    digitalWrite(PA_CTRL, HIGH);
+    Serial.printf("PA_CTRL (GPIO%d) set HIGH\n", PA_CTRL);
   
     Serial.println("Water Consumption Prediction Model");
     Serial.println("Initializing TensorFlow Lite Micro Interpreter...");
@@ -488,6 +602,20 @@ void setup() {
     Serial.println("Water prediction model ready. Press 'p' to predict or 't' to test with mock audio.");
   
     boot_time = millis();
+    // Allocate mic buffer in PSRAM
+    mic_buffer = (int16_t*)ps_malloc(MIC_SAMPLE_COUNT * sizeof(int16_t));
+    if (!mic_buffer) {
+        Serial.println("Failed to allocate mic_buffer in PSRAM!");
+        while (1);
+    }
+    // Initialize I2S for microphone and speaker
+    initI2SMic();
+    // Initialize ES8311 codec using new class
+    if (!codec.begin(I2C_SDA, I2C_SCL, 16000, 90, 3, 6144000)) {
+        Serial.println("ES8311 codec initialization failed!");
+        while (1);
+    }
+    Serial.println("ES8311 codec initialized (simple class).");
 }
 
 void loop() {
@@ -497,6 +625,7 @@ void loop() {
         printLoading();
         Serial.println("Loading complete");
         loading = false;
+        Serial.println("Press 'h' for help.");
     }
 
     // Print status every 30 seconds
@@ -521,6 +650,19 @@ void loop() {
         } else if (inputValue == "m" || inputValue == "M") {
             // Check memory usage
             checkMemoryUsage();
+        } else if (inputValue == "a" || inputValue == "A") {
+            sampleMicAndPrintStats();
+        } else if (inputValue == "r" || inputValue == "R") {
+            playMicSample();
+        } else if (inputValue == "s" || inputValue == "S") {
+            fillBufferWithSine(1000.0f);
+            playMicSample();
+        } else if (inputValue == "e" || inputValue == "E") {
+            digitalWrite(PA_CTRL, HIGH);
+            Serial.println("PA_CTRL enabled (HIGH)");
+        } else if (inputValue == "d" || inputValue == "D") {
+            digitalWrite(PA_CTRL, LOW);
+            Serial.println("PA_CTRL disabled (LOW)");
         } else if (inputValue == "h" || inputValue == "H") {
             // Show help
             showHelp();
@@ -528,4 +670,5 @@ void loop() {
             Serial.println("Unknown command. Press 'h' for help.");
         }
     }
+    // Note: If no sound, try both PA_CTRL HIGH and LOW. Some boards use active LOW for amplifier enable.
 }
