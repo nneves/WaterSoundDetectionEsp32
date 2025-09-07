@@ -169,76 +169,6 @@ void generateMockAudio(float* audio_data, int length) {
   }
 }
 
-void setup() {
-  Serial.begin(115200);
-  while(!Serial);
-
-  Serial.println("Water Consumption Prediction Model");
-  Serial.println("Initializing TensorFlow Lite Micro Interpreter...");
-
-  // Map the model into a usable data structure. This doesn't involve any
-  // copying or parsing, it's a very lightweight operation.
-  model = tflite::GetModel(model_improved_int8_3_2_1_tflite);
-  
-  Serial.printf("Model loaded successfully. Size: %d bytes\n", model_improved_int8_3_2_1_tflite_len);
-
-  // Check if model and library have compatible schema version,
-  // if not, there is a misalignement between TensorFlow version used
-  // to train and generate the TFLite model and the current version of library
-  Serial.printf("Model version: %d, Library version: %d\n", model->version(), TFLITE_SCHEMA_VERSION);
-  if (model->version() != TFLITE_SCHEMA_VERSION) {
-    Serial.println("Model provided and schema version are not equal!");
-    while(true); // stop program here
-  }
-
-  // This pulls in all the TensorFlow Lite operators.
-  static tflite::AllOpsResolver resolver;
-
-  // Build an interpreter to run the model with.
-  static tflite::MicroInterpreter static_interpreter(
-      model, resolver, tensor_arena, kTensorArenaSize);
-  interpreter = &static_interpreter;
-
-  // Allocate memory from the tensor_arena for the model's tensors.
-  // if an error occurs, stop the program.
-  TfLiteStatus allocate_status = interpreter->AllocateTensors();
-  if (allocate_status != kTfLiteOk) {
-    Serial.println("AllocateTensors() failed");
-    while(true); // stop program here
-  }
-  
-  Serial.println("Tensor allocation successful");
-  
-  // Check actual memory usage
-  Serial.printf("Tensor arena size: %d bytes (%.2f KB)\r\n", kTensorArenaSize, kTensorArenaSize / 1024.0);
-  Serial.printf("Free heap after allocation: %d bytes\r\n", ESP.getFreeHeap());
-
-  // Obtain pointers to the model's input and output tensors.
-  input = interpreter->input(0);
-  output = interpreter->output(0);
-  
-  // Print tensor information
-  Serial.printf("Input tensor dimensions: ");
-  for (int i = 0; i < input->dims->size; i++) {
-    Serial.printf("%d", input->dims->data[i]);
-    if (i < input->dims->size - 1) Serial.printf("x");
-  }
-  Serial.printf(" (type: %d)\r\n", input->type);
-  
-  Serial.printf("Output tensor dimensions: ");
-  for (int i = 0; i < output->dims->size; i++) {
-    Serial.printf("%d", output->dims->data[i]);
-    if (i < output->dims->size - 1) Serial.printf("x");
-  }
-  Serial.printf(" (type: %d)\r\n", output->type);
-
-  Serial.println("Initialization done.");
-  Serial.println("");
-  Serial.println("Water prediction model ready. Press 'p' to predict or 't' to test with mock audio.");
-
-  boot_time = millis();
-}
-
 void printLoading() {
     Serial.println("======================================");
     Serial.println("ESP32-S3 Touch AMOLED 1.75-B Hardware Test");
@@ -311,44 +241,6 @@ void checkMemory() {
         Serial.printf("Free PSRAM: %.2f KB\r\n", free_psram / 1024.0);
     }
     Serial.println("=== End Status ===\n"); 
-}
-
-void loop() {
-    if (loading) {
-        Serial.println("Loading...");
-        delay(5000);
-        printLoading();
-        Serial.println("Loading complete");
-        loading = false;
-    }
-
-    // Print status every 30 seconds
-    if (millis() - last_status > 30000) {
-        checkMemory();
-        last_status = millis();
-    }
-
-    // Check for serial input
-    if (Serial.available()) {
-        String inputValue = Serial.readStringUntil('\n');
-        inputValue.trim();
-        
-        if (inputValue == "p" || inputValue == "P") {
-            // Perform water prediction with mock audio
-            performWaterPrediction();
-        } else if (inputValue == "t" || inputValue == "T") {
-            // Test with mock audio
-            testWithMockAudio();
-        } else if (inputValue == "m" || inputValue == "M") {
-            // Check memory usage
-            checkMemoryUsage();
-        } else if (inputValue == "h" || inputValue == "H") {
-            // Show help
-            showHelp();
-        } else {
-            Serial.println("Unknown command. Press 'h' for help.");
-        }
-    }
 }
 
 void performWaterPrediction() {
@@ -526,4 +418,114 @@ void printMFCCStats(float* mfcc_data, int length, const char* label) {
     
     Serial.printf("%s - Min: %.4f, Max: %.4f, Mean: %.4f, Range: %.4f\r\n", 
                   label, min_val, max_val, mean, range);
+}
+
+void setup() {
+    Serial.begin(115200);
+    while(!Serial);
+  
+    Serial.println("Water Consumption Prediction Model");
+    Serial.println("Initializing TensorFlow Lite Micro Interpreter...");
+  
+    // Map the model into a usable data structure. This doesn't involve any
+    // copying or parsing, it's a very lightweight operation.
+    model = tflite::GetModel(model_improved_int8_3_2_1_tflite);
+    
+    Serial.printf("Model loaded successfully. Size: %d bytes\n", model_improved_int8_3_2_1_tflite_len);
+  
+    // Check if model and library have compatible schema version,
+    // if not, there is a misalignement between TensorFlow version used
+    // to train and generate the TFLite model and the current version of library
+    Serial.printf("Model version: %d, Library version: %d\n", model->version(), TFLITE_SCHEMA_VERSION);
+    if (model->version() != TFLITE_SCHEMA_VERSION) {
+      Serial.println("Model provided and schema version are not equal!");
+      while(true); // stop program here
+    }
+  
+    // This pulls in all the TensorFlow Lite operators.
+    static tflite::AllOpsResolver resolver;
+  
+    // Build an interpreter to run the model with.
+    static tflite::MicroInterpreter static_interpreter(
+        model, resolver, tensor_arena, kTensorArenaSize);
+    interpreter = &static_interpreter;
+  
+    // Allocate memory from the tensor_arena for the model's tensors.
+    // if an error occurs, stop the program.
+    TfLiteStatus allocate_status = interpreter->AllocateTensors();
+    if (allocate_status != kTfLiteOk) {
+      Serial.println("AllocateTensors() failed");
+      while(true); // stop program here
+    }
+    
+    Serial.println("Tensor allocation successful");
+    
+    // Check actual memory usage
+    Serial.printf("Tensor arena size: %d bytes (%.2f KB)\r\n", kTensorArenaSize, kTensorArenaSize / 1024.0);
+    Serial.printf("Free heap after allocation: %d bytes\r\n", ESP.getFreeHeap());
+  
+    // Obtain pointers to the model's input and output tensors.
+    input = interpreter->input(0);
+    output = interpreter->output(0);
+    
+    // Print tensor information
+    Serial.printf("Input tensor dimensions: ");
+    for (int i = 0; i < input->dims->size; i++) {
+      Serial.printf("%d", input->dims->data[i]);
+      if (i < input->dims->size - 1) Serial.printf("x");
+    }
+    Serial.printf(" (type: %d)\r\n", input->type);
+    
+    Serial.printf("Output tensor dimensions: ");
+    for (int i = 0; i < output->dims->size; i++) {
+      Serial.printf("%d", output->dims->data[i]);
+      if (i < output->dims->size - 1) Serial.printf("x");
+    }
+    Serial.printf(" (type: %d)\r\n", output->type);
+  
+    Serial.println("Initialization done.");
+    Serial.println("");
+    Serial.println("Water prediction model ready. Press 'p' to predict or 't' to test with mock audio.");
+  
+    boot_time = millis();
+}
+
+void loop() {
+    if (loading) {
+        Serial.println("Loading...");
+        delay(5000);
+        printLoading();
+        Serial.println("Loading complete");
+        loading = false;
+    }
+
+    // Print status every 30 seconds
+    /*
+    if (millis() - last_status > 30000) {
+        checkMemory();
+        last_status = millis();
+    }
+    */
+
+    // Check for serial input
+    if (Serial.available()) {
+        String inputValue = Serial.readStringUntil('\n');
+        inputValue.trim();
+        
+        if (inputValue == "p" || inputValue == "P") {
+            // Perform water prediction with mock audio
+            performWaterPrediction();
+        } else if (inputValue == "t" || inputValue == "T") {
+            // Test with mock audio
+            testWithMockAudio();
+        } else if (inputValue == "m" || inputValue == "M") {
+            // Check memory usage
+            checkMemoryUsage();
+        } else if (inputValue == "h" || inputValue == "H") {
+            // Show help
+            showHelp();
+        } else {
+            Serial.println("Unknown command. Press 'h' for help.");
+        }
+    }
 }
