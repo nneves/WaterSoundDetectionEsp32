@@ -13,6 +13,9 @@
 #include "tensorflow/lite/micro/all_ops_resolver.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/schema/schema_generated.h"
+// TFLM microfrontend for real MFCC-like features
+#include "tensorflow/lite/experimental/microfrontend/lib/frontend_util.h"
+#include "tensorflow/lite/experimental/microfrontend/lib/frontend.h"
 
 
 // Globals pointers, used to address TensorFlow Lite components.
@@ -29,12 +32,10 @@ TfLiteTensor* output = nullptr;
 // to store tensors and intermediate results
 // Increased size for 70KB water prediction model with MFCC features
 // Model size + intermediate tensors + working memory
-constexpr int kTensorArenaSize = 50 * 1024; // 58 * 1024;  // 140KB for model operations
+constexpr int kTensorArenaSize = 50 * 1024; // 50KB arena in DRAM
 
-// Keep aligned to 16 bytes for CMSIS (Cortex Microcontroller Software Interface Standard)
-// alignas(16) directive is used to specify that the array 
-// should be stored in memory at an address that is a multiple of 16.
-alignas(16) uint8_t tensor_arena[kTensorArenaSize];
+// Tensor arena in DRAM (aligned to 16 bytes)
+alignas(16) static uint8_t tensor_arena[kTensorArenaSize];
 
 unsigned long boot_time = 0;
 unsigned long last_status = 0;
@@ -50,10 +51,45 @@ const int MAX_SEQUENCE_LENGTH = 200;
 const int FRAME_LENGTH_SAMPLES = 400;  // 25ms @ 16kHz
 const int HOP_LENGTH_SAMPLES = 160;    // 10ms @ 16kHz
 
-// MFCC processing buffers
-float audio_buffer[SAMPLES_PER_CHUNK];
-float mfcc_buffer[N_MFCC * MAX_SEQUENCE_LENGTH];
-int8_t quantized_input[N_MFCC * MAX_SEQUENCE_LENGTH];
+// Small MFCC buffers in DRAM
+static float mfcc_buffer[N_MFCC * MAX_SEQUENCE_LENGTH];
+static int8_t quantized_input[N_MFCC * MAX_SEQUENCE_LENGTH];
+
+// Microfrontend state and helpers
+static FrontendConfig fe_config;
+static FrontendState fe_state;
+static bool fe_initialized = false;
+static int fe_num_mel = 0;
+
+// DCT cache for converting mel bands to MFCCs (DCT-II)
+static bool dct_initialized = false;
+static int dct_mel_bins = 0;
+static float dct_matrix[N_MFCC * 64]; // supports up to 64 mel bins
+
+static void ensureDctMatrix(int mel_bins) {
+  if (dct_initialized && dct_mel_bins == mel_bins) return;
+  for (int n = 0; n < N_MFCC; n++) {
+    for (int k = 0; k < mel_bins; k++) {
+      float angle = (float)PI / (float)mel_bins * (k + 0.5f) * n;
+      // Orthonormal DCT-II scaling: alpha0 = sqrt(1/M), alpha = sqrt(2/M)
+      float alpha = (n == 0) ? sqrtf(1.0f / (float)mel_bins) : sqrtf(2.0f / (float)mel_bins);
+      dct_matrix[n * mel_bins + k] = alpha * cosf(angle);
+    }
+  }
+  dct_initialized = true;
+  dct_mel_bins = mel_bins;
+}
+
+static inline void melToMfcc(const uint16_t* mel, int mel_bins, float* mfcc_out /* length N_MFCC */) {
+  ensureDctMatrix(mel_bins);
+  for (int n = 0; n < N_MFCC; n++) {
+    float acc = 0.0f;
+    for (int k = 0; k < mel_bins; k++) {
+      acc += ((float)mel[k]) * dct_matrix[n * mel_bins + k];
+    }
+    mfcc_out[n] = acc;
+  }
+}
 
 // Function declarations
 void extractMFCCFeatures(float* audio_data, int audio_length, float* mfcc_output);
@@ -67,82 +103,68 @@ void checkMemoryUsage();
 void showHelp();
 void printMFCCStats(float* mfcc_data, int length, const char* label);
 
-// Enhanced MFCC-like feature extraction with better frequency analysis
+// Audio generator mode for tests: 0=water default, 1=low, 2=medium, 3=high, 4=sine1k
+static int g_audio_gen_mode = 0;
+
+// Extract MFCC features using TFLM microfrontend (mel + log + PCAN), then DCT-II
 void extractMFCCFeatures(float* audio_data, int audio_length, float* mfcc_output) {
   // Clear output buffer
   for (int i = 0; i < N_MFCC * MAX_SEQUENCE_LENGTH; i++) {
     mfcc_output[i] = 0.0f;
   }
   
-  // Calculate total frames using 25ms window and 10ms hop
-  int total_frames = 0;
-  if (audio_length >= FRAME_LENGTH_SAMPLES) {
-    total_frames = 1 + (audio_length - FRAME_LENGTH_SAMPLES) / HOP_LENGTH_SAMPLES;
-  }
-  int sequence_length = min(total_frames, MAX_SEQUENCE_LENGTH);
-  
-  // Enhanced feature extraction with better frequency analysis
-  int frame_start_index = 0;
-  if (total_frames > MAX_SEQUENCE_LENGTH) {
-    // Keep the last MAX_SEQUENCE_LENGTH frames (match Keras truncating="pre")
-    frame_start_index = total_frames - MAX_SEQUENCE_LENGTH;
-  }
+  // Reset frontend state for a fresh run
+  FrontendReset(&fe_state);
 
-  for (int t = 0; t < sequence_length; t++) {
-    int frame_index = frame_start_index + t;
-    int start_sample = frame_index * HOP_LENGTH_SAMPLES;
-    int end_sample = start_sample + FRAME_LENGTH_SAMPLES; // guaranteed <= audio_length
-    
-    // Calculate frame energy
-    float frame_energy = 0.0f;
-    for (int s = start_sample; s < end_sample; s++) {
-      frame_energy += audio_data[s] * audio_data[s];
-    }
-    frame_energy = sqrt(frame_energy / (end_sample - start_sample));
-    
-    // Calculate frequency domain features (simplified)
-    float freq_bands[N_MFCC];
-    
-    // Band 0: DC component (average)
-    freq_bands[0] = 0.0f;
-    for (int s = start_sample; s < end_sample; s++) {
-      freq_bands[0] += audio_data[s];
-    }
-    freq_bands[0] /= (end_sample - start_sample);
-    
-    // Bands 1-12: Different frequency ranges
-    for (int m = 1; m < N_MFCC; m++) {
-      float freq_sum = 0.0f;
-      float freq_weight = (float)m / N_MFCC; // 0 to 1
-      
-      // Simulate frequency analysis with different frequency components
-      for (int s = start_sample; s < end_sample; s++) {
-        float t_norm = (float)(s - start_sample) / (float)FRAME_LENGTH_SAMPLES;
-        float freq = 50.0f + freq_weight * 2000.0f; // 50Hz to 2050Hz range
-        freq_sum += audio_data[s] * sin(2.0f * PI * freq * t_norm);
+  int frames_collected = 0;
+  
+  // Stream audio in hops to avoid large buffers
+  int total_samples = audio_length;
+  int generated = 0;
+  while (generated < total_samples) {
+    int chunk = min(HOP_LENGTH_SAMPLES, total_samples - generated);
+    int16_t temp[HOP_LENGTH_SAMPLES];
+    for (int i = 0; i < chunk; i++) {
+      float v;
+      if (audio_data) {
+        v = audio_data[generated + i];
+      } else {
+        float t = (float)(generated + i) / SAMPLE_RATE;
+        if (g_audio_gen_mode == 1) {
+          float base = 0.05f * sinf(2.0f * PI * 50.0f * t) + 0.02f * sinf(2.0f * PI * 100.0f * t) + 0.01f * ((float)random(-200, 200) / 1000.0f);
+          v = base * 0.3f;
+        } else if (g_audio_gen_mode == 2) {
+          float base = 0.2f * sinf(2.0f * PI * 200.0f * t) + 0.1f * sinf(2.0f * PI * 500.0f * t) + 0.05f * sinf(2.0f * PI * 1000.0f * t) + 0.03f * ((float)random(-500, 500) / 1000.0f);
+          v = base;
+        } else if (g_audio_gen_mode == 3) {
+          float base = 0.4f * sinf(2.0f * PI * 300.0f * t) + 0.3f * sinf(2.0f * PI * 800.0f * t) + 0.2f * sinf(2.0f * PI * 1500.0f * t) + 0.15f * sinf(2.0f * PI * 2500.0f * t) + 0.1f * ((float)random(-800, 800) / 1000.0f);
+          v = base * 1.5f;
+        } else if (g_audio_gen_mode == 4) {
+          v = 0.7f * sinf(2.0f * PI * 1000.0f * t);
+        } else {
+          v = 0.3f * sinf(2.0f * PI * 100.0f * t) + 0.2f * sinf(2.0f * PI * 500.0f * t) + 0.1f * sinf(2.0f * PI * 2000.0f * t) + 0.05f * ((float)random(-1000, 1000) / 1000.0f);
+        }
       }
-      freq_bands[m] = freq_sum / (end_sample - start_sample);
+      if (v > 1.0f) v = 1.0f; if (v < -1.0f) v = -1.0f;
+      int32_t s = (int32_t)roundf(v * 32767.0f);
+      if (s > 32767) s = 32767; if (s < -32768) s = -32768;
+      temp[i] = (int16_t)s;
     }
-    
-    // Apply mel-scale-like transformation and create MFCC-like features
-    for (int m = 0; m < N_MFCC; m++) {
-      int idx = t * N_MFCC + m;
-      
-      // Apply mel-scale-like weighting
-      float mel_weight = 1.0f;
-      if (m > 0) {
-        mel_weight = log(1.0f + (float)m * 0.1f); // Approximate mel scale
+    size_t num_read = 0;
+    FrontendOutput fe_out = FrontendProcessSamples(&fe_state, temp, (size_t)chunk, &num_read);
+    generated += (int)num_read;
+    if (fe_out.size > 0 && fe_out.values != nullptr) {
+      float mfcc_frame[N_MFCC];
+      melToMfcc(fe_out.values, (int)fe_out.size, mfcc_frame);
+      // Zero the 0th cepstral coefficient (optional parity tweak)
+      mfcc_frame[0] = 0.0f;
+      if (frames_collected < MAX_SEQUENCE_LENGTH) {
+        for (int m = 0; m < N_MFCC; m++) mfcc_output[frames_collected * N_MFCC + m] = mfcc_frame[m];
+        frames_collected++;
+      } else {
+        memmove(mfcc_output, mfcc_output + N_MFCC, (MAX_SEQUENCE_LENGTH - 1) * N_MFCC * sizeof(float));
+        for (int m = 0; m < N_MFCC; m++) mfcc_output[(MAX_SEQUENCE_LENGTH - 1) * N_MFCC + m] = mfcc_frame[m];
       }
-      
-      // Combine energy and frequency information
-      float mfcc_value = freq_bands[m] * mel_weight * frame_energy;
-      
-      // Apply DCT-like transformation (simplified)
-      if (m > 0) {
-        mfcc_value *= cos(PI * m * t / sequence_length);
-      }
-      
-      mfcc_output[idx] = mfcc_value;
     }
   }
 }
@@ -265,13 +287,11 @@ void performWaterPrediction() {
     // Check memory before processing
     Serial.printf("Free heap before processing: %d bytes\r\n", ESP.getFreeHeap());
     
-    // Generate mock audio data (replace with real microphone input)
-    Serial.println("Generating mock audio data...");
-    generateMockAudio(audio_buffer, SAMPLES_PER_CHUNK);
-    
-    // Extract MFCC features
+    // Generate audio via internal generator and extract MFCCs
+    Serial.println("Generating mock audio (internal generator)...");
     Serial.println("Extracting MFCC features...");
-    extractMFCCFeatures(audio_buffer, SAMPLES_PER_CHUNK, mfcc_buffer);
+    g_audio_gen_mode = 0;
+    extractMFCCFeatures(nullptr, SAMPLES_PER_CHUNK, mfcc_buffer);
     
     // Normalize features
     normalizeMFCC(mfcc_buffer, N_MFCC * MAX_SEQUENCE_LENGTH);
@@ -314,42 +334,9 @@ void testWithMockAudio() {
     for (int test = 0; test < 3; test++) {
         Serial.printf("Test %d: ", test + 1);
         
-        // Generate different mock audio patterns with temporal variation
-        for (int i = 0; i < SAMPLES_PER_CHUNK; i++) {
-            float t = (float)i / SAMPLE_RATE;
-            
-            // Add temporal envelope to simulate water flow patterns
-            float envelope = 0.5f + 0.5f * sin(2.0f * PI * 0.5f * t); // Slow modulation
-            
-            if (test == 0) {
-                // Test 1: Low water flow (target ~0.22 liters)
-                // Very low amplitude, simple pattern, slow variations
-                float base_signal = 0.05f * sin(2.0f * PI * 50.0f * t) +   
-                                   0.02f * sin(2.0f * PI * 100.0f * t) +   
-                                   0.01f * ((float)random(-200, 200) / 1000.0f);
-                audio_buffer[i] = base_signal * envelope * 0.3f; // Reduce overall amplitude
-            } else if (test == 1) {
-                // Test 2: Medium water flow (target ~1-2 liters)
-                // Moderate amplitude and frequency range
-                float base_signal = 0.2f * sin(2.0f * PI * 200.0f * t) + 
-                                   0.1f * sin(2.0f * PI * 500.0f * t) +
-                                   0.05f * sin(2.0f * PI * 1000.0f * t) +
-                                   0.03f * ((float)random(-500, 500) / 1000.0f);
-                audio_buffer[i] = base_signal * envelope;
-            } else {
-                // Test 3: High water flow (target ~3+ liters)
-                // Higher amplitude, more frequency components, more noise
-                float base_signal = 0.4f * sin(2.0f * PI * 300.0f * t) + 
-                                   0.3f * sin(2.0f * PI * 800.0f * t) +
-                                   0.2f * sin(2.0f * PI * 1500.0f * t) +
-                                   0.15f * sin(2.0f * PI * 2500.0f * t) +
-                                   0.1f * ((float)random(-800, 800) / 1000.0f);
-                audio_buffer[i] = base_signal * envelope * 1.5f; // Increase overall amplitude
-            }
-        }
-        
-        // Process and predict
-        extractMFCCFeatures(audio_buffer, SAMPLES_PER_CHUNK, mfcc_buffer);
+        // Select generator mode and process
+        g_audio_gen_mode = (test == 0 ? 1 : test == 1 ? 2 : 3);
+        extractMFCCFeatures(nullptr, SAMPLES_PER_CHUNK, mfcc_buffer);
         
         // Print MFCC statistics before normalization
         char label[50];
@@ -438,11 +425,9 @@ void printMFCCStats(float* mfcc_data, int length, const char* label) {
 }
 
 void fillBufferWithSine(float freq) {
-    for (int i = 0; i < SAMPLES_PER_CHUNK; i++) {
-        float t = (float)i / SAMPLE_RATE;
-        audio_buffer[i] = 0.7f * sinf(2.0f * PI * freq * t);
-    }
-    Serial.printf("Filled audio buffer with %.1f Hz sine wave\r\n", freq);
+    // No-op in DRAM-only mode; use generator instead
+    (void)freq;
+    Serial.println("Using internal sine generator");
 }
 
 unsigned long lastSine = 0;
@@ -512,6 +497,23 @@ void setup() {
     Serial.printf(" (type: %d)\r\n", output->type);
     Serial.printf("Output bytes: %d, scale: %.6f, zero_point: %d\r\n", output->bytes, output->params.scale, output->params.zero_point);
   
+    // Initialize microfrontend config/state (46ms window, 32ms hop, 64 mel channels)
+    FrontendFillConfigWithDefaults(&fe_config);
+    fe_config.window.size_ms = 46;  // closer to typical librosa default frame length
+    fe_config.window.step_size_ms = 32; // hop
+    fe_config.filterbank.num_channels = 64; // increase mel resolution
+    fe_config.filterbank.lower_band_limit = 20.0f;
+    fe_config.filterbank.upper_band_limit = 7600.0f;
+    fe_config.pcan_gain_control.enable_pcan = 0; // disable PCAN
+    // Disable noise reduction (parity with librosa): set min_signal_remaining = 1.0
+    fe_config.noise_reduction.min_signal_remaining = 1.0f;
+    fe_config.log_scale.enable_log = 1;          // keep log scale
+    fe_config.log_scale.scale_shift = 6;
+    FrontendPopulateState(&fe_config, &fe_state, SAMPLE_RATE);
+    fe_num_mel = fe_state.filterbank.num_channels;
+    Serial.printf("Microfrontend initialized: mel bins=%d, frame=%d, hop=%d\r\n",
+                  fe_num_mel, (int)fe_state.window.size, (int)fe_state.window.step);
+
     Serial.println("Initialization done.");
     Serial.println("");
     Serial.println("Water prediction model ready. Press 'p' to predict or 't' to test with mock audio.");
@@ -543,8 +545,8 @@ void loop() {
         } else if (inputValue == "m") {
             checkMemoryUsage();
         } else if (inputValue == "s" || inputValue == "S") {
-            fillBufferWithSine(1000.0f);
-            extractMFCCFeatures(audio_buffer, SAMPLES_PER_CHUNK, mfcc_buffer);
+            g_audio_gen_mode = 4;
+            extractMFCCFeatures(nullptr, SAMPLES_PER_CHUNK, mfcc_buffer);
             normalizeMFCC(mfcc_buffer, N_MFCC * MAX_SEQUENCE_LENGTH);
             float input_scale = input->params.scale;
             int input_zero_point = input->params.zero_point;
